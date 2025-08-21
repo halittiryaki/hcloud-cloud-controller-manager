@@ -1,6 +1,10 @@
 package annotation
 
 const (
+	// LoadBalancerProvision flags the cluster Load Balancer Service,
+	// if it should be mapped to a HCloud Load Balancer
+	LoadBalancerProvision Name = "load-balancer.hetzner.cloud/provision"
+
 	// LBPublicIPv4 is the public IPv4 address assigned to the Load Balancer by
 	// the backend. Read-only.
 	LBPublicIPv4 Name = "load-balancer.hetzner.cloud/ipv4"

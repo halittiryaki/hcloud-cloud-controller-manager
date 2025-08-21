@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -960,6 +962,249 @@ func TestLoadBalancer_matchNodeSelector(t *testing.T) {
 			if !reflect.DeepEqual(nodes, c.expected) {
 				t.Errorf("expected: %+v got %+v", c.expected, nodes)
 			}
+		})
+	}
+}
+
+func TestShouldProcessService_Combinations(t *testing.T) {
+	// combinations: config default (true/false) x annotation (absent, "true", "false")
+	cases := []struct {
+		name             string
+		defaultProvision bool
+		annotationSet    bool   // whether annotation is present
+		annotationVal    string // "true" or "false" when annotationSet==true
+		expect           bool
+	}{
+		{"default=true, annotation=absent", true, false, "", true},
+		{"default=true, annotation=true", true, true, "true", true},
+		{"default=true, annotation=false", true, true, "false", false},
+		{"default=false, annotation=absent", false, false, "", false},
+		{"default=false, annotation=true", false, true, "true", true},
+		{"default=false, annotation=false", false, true, "false", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// create controller with given default
+			lbOps := &hcops.MockLoadBalancerOps{}
+			lb := newLoadBalancers(lbOps, true, true, tc.defaultProvision)
+
+			// create service and set annotation if needed
+			svc := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{},
+				},
+			}
+			if tc.annotationSet {
+				svc.Annotations[string(annotation.LoadBalancerProvision)] = tc.annotationVal
+			}
+
+			should, err := lb.shouldProvisionLoadBalancer(svc)
+			if err != nil {
+				t.Fatalf("shouldProvisionLoadBalancer returned error: %v", err)
+			}
+			if should != tc.expect {
+				t.Fatalf("unexpected result: got %v, want %v", should, tc.expect)
+			}
+		})
+	}
+}
+
+// TestControllerProcessingBehavior adds controller-level tests to ensure that
+// when shouldProvisionLoadBalancer indicates "skip" the controller methods do not
+// invoke any LoadBalancerOps, and when it indicates "process" they do invoke
+// the expected LB operations.
+func TestLoadBalancers_ControllerProcessingBehavior(t *testing.T) {
+	cases := []struct {
+		name             string
+		defaultProvision bool
+		annotationSet    bool
+		annotationVal    string
+		expectProcess    bool
+	}{
+		{"default=true, annotation=absent", true, false, "", true},
+		{"default=true, annotation=true", true, true, "true", true},
+		{"default=true, annotation=false", true, true, "false", false},
+		{"default=false, annotation=absent", false, false, "", false},
+		{"default=false, annotation=true", false, true, "true", true},
+		{"default=false, annotation=false", false, true, "false", false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// GET LoadBalancer
+			t.Run("GetLoadBalancer", func(t *testing.T) {
+				tt := LoadBalancerTestCase{
+					Name:                    "get-lb-" + tc.name,
+					ServiceUID:              "g1",
+					ServiceAnnotations:      map[annotation.Name]string{},
+					UseSvcProcessingDefault: hcloud.Ptr(tc.defaultProvision),
+					LB:                      &hcloud.LoadBalancer{ID: 1, Name: "test-lb"},
+				}
+				if tc.annotationSet {
+					tt.ServiceAnnotations[annotation.LoadBalancerProvision] = tc.annotationVal
+				}
+				if tc.expectProcess {
+					tt.Mock = func(_ *testing.T, tt *LoadBalancerTestCase) {
+						tt.LBOps.On("GetByK8SServiceUID", tt.Ctx, tt.Service).Return(nil, hcops.ErrNotFound)
+					}
+				}
+				tt.Perform = func(t *testing.T, tt *LoadBalancerTestCase) {
+					_, _, err := tt.LoadBalancers.GetLoadBalancer(tt.Ctx, tt.ClusterName, tt.Service)
+					assert.NoError(t, err)
+					if tc.expectProcess {
+						if len(tt.LBOps.Calls) == 0 {
+							t.Fatalf("expected LB ops to be called for processing case")
+						}
+					} else {
+						if len(tt.LBOps.Calls) != 0 {
+							t.Fatalf("expected no LB ops calls for skip case, got %d", len(tt.LBOps.Calls))
+						}
+					}
+				}
+				tt.run(t)
+			})
+
+			// ENSURE LoadBalancer
+			t.Run("EnsureLoadBalancer", func(t *testing.T) {
+				tt := LoadBalancerTestCase{
+					Name:                    "ensure-lb-" + tc.name,
+					ServiceUID:              "e1",
+					ServiceAnnotations:      map[annotation.Name]string{},
+					UseSvcProcessingDefault: hcloud.Ptr(tc.defaultProvision),
+					LB:                      &hcloud.LoadBalancer{ID: 2, Name: "ensure-lb"},
+				}
+				// ensure predictable LB name for Create fallback
+				tt.ServiceAnnotations[annotation.LBName] = "ensure-lb"
+				if tc.annotationSet {
+					tt.ServiceAnnotations[annotation.LoadBalancerProvision] = tc.annotationVal
+				}
+				if tc.expectProcess {
+					tt.Mock = func(_ *testing.T, tt *LoadBalancerTestCase) {
+						tt.LBOps.On("GetByK8SServiceUID", tt.Ctx, tt.Service).Return(nil, hcops.ErrNotFound)
+						tt.LBOps.On("GetByName", tt.Ctx, "ensure-lb").Return(nil, hcops.ErrNotFound)
+						tt.LBOps.On("Create", tt.Ctx, tt.LB.Name, tt.Service).Return(tt.LB, nil)
+						tt.LBOps.On("ReconcileHCLB", tt.Ctx, tt.LB, tt.Service).Return(false, nil)
+						tt.LBOps.On("ReconcileHCLBTargets", tt.Ctx, tt.LB, tt.Service, mock.Anything).Return(false, nil)
+						tt.LBOps.On("ReconcileHCLBServices", tt.Ctx, tt.LB, tt.Service).Return(false, nil)
+					}
+				} else {
+					// When processing is disabled, the controller will look up an existing
+					// LB and delete it if present. For the default "skip with no LB"
+					// behavior, simulate no LB present by returning ErrNotFound.
+					tt.Mock = func(_ *testing.T, tt *LoadBalancerTestCase) {
+						tt.LBOps.On("GetByK8SServiceUID", tt.Ctx, tt.Service).Return(nil, hcops.ErrNotFound)
+						// The controller falls back to looking up a Load Balancer by name
+						// when the UID-based lookup returns ErrNotFound. Ensure the mock
+						// reflects that behavior for the "skip with no LB" case.
+						tt.LBOps.On("GetByName", tt.Ctx, "ensure-lb").Return(nil, hcops.ErrNotFound)
+					}
+				}
+				tt.Perform = func(t *testing.T, tt *LoadBalancerTestCase) {
+					_, err := tt.LoadBalancers.EnsureLoadBalancer(tt.Ctx, tt.ClusterName, tt.Service, tt.Nodes)
+					assert.NoError(t, err)
+					if tc.expectProcess {
+						if len(tt.LBOps.Calls) == 0 {
+							t.Fatalf("expected LB ops to be called for processing case")
+						}
+					} else {
+						// When processing is disabled the controller still performs a
+						// lookup to see if an existing Hetzner Load Balancer must be
+						// removed. Ensure that a lookup was performed and that no
+						// creation/reconcile operations were triggered.
+						tt.LBOps.AssertCalled(t, "GetByK8SServiceUID", tt.Ctx, tt.Service)
+						tt.LBOps.AssertNotCalled(t, "Create", mock.Anything, mock.Anything, mock.Anything)
+						tt.LBOps.AssertNotCalled(t, "ReconcileHCLB", mock.Anything, mock.Anything, mock.Anything)
+						tt.LBOps.AssertNotCalled(t, "ReconcileHCLBTargets", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+						tt.LBOps.AssertNotCalled(t, "ReconcileHCLBServices", mock.Anything, mock.Anything, mock.Anything)
+					}
+				}
+				tt.run(t)
+			})
+
+			// UPDATE LoadBalancer
+			t.Run("UpdateLoadBalancer", func(t *testing.T) {
+				tt := LoadBalancerTestCase{
+					Name:                    "update-lb-" + tc.name,
+					ServiceUID:              "u1",
+					ServiceAnnotations:      map[annotation.Name]string{},
+					UseSvcProcessingDefault: hcloud.Ptr(tc.defaultProvision),
+					LB:                      &hcloud.LoadBalancer{ID: 3, Name: "update-lb"},
+				}
+				tt.ServiceAnnotations[annotation.LBName] = "update-lb"
+				if tc.annotationSet {
+					tt.ServiceAnnotations[annotation.LoadBalancerProvision] = tc.annotationVal
+				}
+				if tc.expectProcess {
+					tt.Mock = func(_ *testing.T, tt *LoadBalancerTestCase) {
+						tt.LBOps.On("GetByK8SServiceUID", tt.Ctx, tt.Service).Return(tt.LB, nil)
+						tt.LBOps.On("ReconcileHCLB", tt.Ctx, tt.LB, tt.Service).Return(false, nil)
+						tt.LBOps.On("ReconcileHCLBTargets", tt.Ctx, tt.LB, tt.Service, mock.Anything).Return(false, nil)
+						tt.LBOps.On("ReconcileHCLBServices", tt.Ctx, tt.LB, tt.Service).Return(false, nil)
+					}
+				} else {
+					// When processing is disabled we expect the controller to look up
+					// any existing LB and delete it. Set the mock accordingly.
+					tt.Mock = func(_ *testing.T, tt *LoadBalancerTestCase) {
+						tt.LBOps.On("GetByK8SServiceUID", tt.Ctx, tt.Service).Return(tt.LB, nil)
+						tt.LBOps.On("Delete", tt.Ctx, tt.LB).Return(nil)
+					}
+				}
+				tt.Perform = func(t *testing.T, tt *LoadBalancerTestCase) {
+					err := tt.LoadBalancers.UpdateLoadBalancer(tt.Ctx, tt.ClusterName, tt.Service, tt.Nodes)
+					assert.NoError(t, err)
+					// In both processing and disabled-but-existing-LB cases there should be
+					// at least one LB operation performed. If processing is disabled
+					// and no LB existed, mocks would have returned ErrNotFound and no
+					// expectations would be set.
+					if tc.expectProcess {
+						if len(tt.LBOps.Calls) == 0 {
+							t.Fatalf("expected LB ops to be called for processing case")
+						}
+					} else {
+						// For the "disabled" test we set up a mock LB and expect Delete to be called.
+						if len(tt.LBOps.Calls) == 0 {
+							t.Fatalf("expected LB ops to be called for disabled-but-existing-LB case")
+						}
+					}
+				}
+				tt.run(t)
+			})
+
+			// DELETE LoadBalancer
+			t.Run("EnsureLoadBalancerDeleted", func(t *testing.T) {
+				tt := LoadBalancerTestCase{
+					Name:                    "delete-lb-" + tc.name,
+					ServiceUID:              "d1",
+					ServiceAnnotations:      map[annotation.Name]string{},
+					UseSvcProcessingDefault: hcloud.Ptr(tc.defaultProvision),
+					LB:                      &hcloud.LoadBalancer{ID: 4, Name: "delete-lb"},
+				}
+				if tc.annotationSet {
+					tt.ServiceAnnotations[annotation.LoadBalancerProvision] = tc.annotationVal
+				}
+				if tc.expectProcess {
+					tt.Mock = func(_ *testing.T, tt *LoadBalancerTestCase) {
+						tt.LBOps.On("GetByK8SServiceUID", tt.Ctx, tt.Service).Return(tt.LB, nil)
+						tt.LBOps.On("Delete", tt.Ctx, tt.LB).Return(nil)
+					}
+				}
+				tt.Perform = func(t *testing.T, tt *LoadBalancerTestCase) {
+					err := tt.LoadBalancers.EnsureLoadBalancerDeleted(tt.Ctx, tt.ClusterName, tt.Service)
+					assert.NoError(t, err)
+					if tc.expectProcess {
+						if len(tt.LBOps.Calls) == 0 {
+							t.Fatalf("expected LB ops to be called for processing case")
+						}
+					} else {
+						if len(tt.LBOps.Calls) != 0 {
+							t.Fatalf("expected no LB ops calls for skip case, got %d", len(tt.LBOps.Calls))
+						}
+					}
+				}
+				tt.run(t)
+			})
 		})
 	}
 }

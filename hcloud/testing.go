@@ -24,10 +24,14 @@ type LoadBalancerTestCase struct {
 	ServiceAnnotations       map[annotation.Name]string
 	UsePrivateIngressDefault *bool
 	UseIPv6Default           *bool
-	Nodes                    []*corev1.Node
-	LB                       *hcloud.LoadBalancer
-	LBCreateResult           *hcloud.LoadBalancerCreateResult
-	Mock                     func(t *testing.T, tt *LoadBalancerTestCase)
+	// UseSvcProcessingDefault controls the default behavior for whether
+	// Services of type LoadBalancer are processed by the controller when the
+	// per-service annotation `load-balancer.hetzner.cloud/provision` is absent.
+	UseSvcProcessingDefault *bool
+	Nodes                   []*corev1.Node
+	LB                      *hcloud.LoadBalancer
+	LBCreateResult          *hcloud.LoadBalancerCreateResult
+	Mock                    func(t *testing.T, tt *LoadBalancerTestCase)
 
 	// Defines the actual test
 	Perform func(t *testing.T, tt *LoadBalancerTestCase)
@@ -78,7 +82,11 @@ func (tt *LoadBalancerTestCase) run(t *testing.T) {
 		tt.Mock(t, tt)
 	}
 
-	tt.LoadBalancers = newLoadBalancers(tt.LBOps, *tt.UsePrivateIngressDefault, *tt.UseIPv6Default)
+	if tt.UseSvcProcessingDefault == nil {
+		tt.UseSvcProcessingDefault = hcloud.Ptr(true)
+	}
+
+	tt.LoadBalancers = newLoadBalancers(tt.LBOps, *tt.UsePrivateIngressDefault, *tt.UseIPv6Default, *tt.UseSvcProcessingDefault)
 	tt.Perform(t, tt)
 
 	tt.LBOps.AssertExpectations(t)

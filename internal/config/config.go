@@ -37,6 +37,7 @@ const (
 	hcloudLoadBalancersDisablePrivateIngress = "HCLOUD_LOAD_BALANCERS_DISABLE_PRIVATE_INGRESS"
 	hcloudLoadBalancersUsePrivateIP          = "HCLOUD_LOAD_BALANCERS_USE_PRIVATE_IP"
 	hcloudLoadBalancersDisableIPv6           = "HCLOUD_LOAD_BALANCERS_DISABLE_IPV6"
+	hcloudLoadBalancersDefaultProvision      = "HCLOUD_LOAD_BALANCERS_DEFAULT_PROVISION"
 
 	hcloudMetricsEnabled = "HCLOUD_METRICS_ENABLED"
 	hcloudMetricsAddress = ":8233"
@@ -82,6 +83,13 @@ type LoadBalancerConfiguration struct {
 	PrivateIngressEnabled bool
 	PrivateIPEnabled      bool
 	IPv6Enabled           bool
+
+	// DefaultProvision controls whether services of type LoadBalancer are processed
+	// by default when the annotation `load-balancer.hetzner.cloud/provision` is
+	// not present. When true, services are processed unless explicitly disabled
+	// with the annotation. When false, services are ignored unless explicitly
+	// enabled with the annotation.
+	DefaultProvision bool
 }
 
 type NetworkConfiguration struct {
@@ -188,6 +196,11 @@ func Read() (HCCMConfiguration, error) {
 		errs = append(errs, err)
 	}
 	cfg.LoadBalancer.IPv6Enabled = !disableIPv6 // Invert the logic, as the env var is prefixed with DISABLE_.
+
+	cfg.LoadBalancer.DefaultProvision, err = getEnvBool(hcloudLoadBalancersDefaultProvision, false)
+	if err != nil {
+		errs = append(errs, err)
+	}
 
 	cfg.Network.NameOrID = os.Getenv(hcloudNetwork)
 	disableAttachedCheck, err := getEnvBool(hcloudNetworkDisableAttachedCheck, false)

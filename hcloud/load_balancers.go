@@ -34,14 +34,35 @@ type loadBalancers struct {
 	ipv6EnabledDefault           bool
 	proxyProtocolEnabledDefault  bool
 	privateIngressEnabledDefault bool
+
+	// svcProcessingDefault controls whether Services of type LoadBalancer are
+	// processed by default when the annotation `load-balancer.hetzner.cloud/provision`
+	// is not present. This mirrors the configuration option exposed by the
+	// HCCM configuration.
+	svcProcessingDefault bool
 }
 
-func newLoadBalancers(lbOps LoadBalancerOps, privateIngressEnabledDefault bool, ipv6EnabledDefault bool) *loadBalancers {
+func newLoadBalancers(lbOps LoadBalancerOps, privateIngressEnabledDefault bool, ipv6EnabledDefault bool, svcProcessingDefault bool) *loadBalancers {
 	return &loadBalancers{
 		lbOps:                        lbOps,
 		ipv6EnabledDefault:           ipv6EnabledDefault,
 		privateIngressEnabledDefault: privateIngressEnabledDefault,
+		svcProcessingDefault:         svcProcessingDefault,
 	}
+}
+
+// shouldProvisionLoadBalancer decides whether a Service of type LoadBalancer should be
+// processed by the controller, taking into account the per-service annotation
+// and the global default configured behavior.
+func (l *loadBalancers) shouldProvisionLoadBalancer(svc *corev1.Service) (bool, error) {
+	enabled, err := annotation.LoadBalancerProvision.BoolFromService(svc)
+	if err == nil {
+		return enabled, nil
+	}
+	if errors.Is(err, annotation.ErrNotSet) {
+		return l.svcProcessingDefault, nil
+	}
+	return false, err
 }
 
 func matchNodeSelector(svc *corev1.Service, nodes []*corev1.Node) ([]*corev1.Node, error) {
@@ -72,6 +93,15 @@ func (l *loadBalancers) GetLoadBalancer(
 ) (status *corev1.LoadBalancerStatus, exists bool, err error) {
 	const op = "hcloud/loadBalancers.GetLoadBalancer"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
+
+	// Skip processing when service annotation + default config indicate so.
+	enabled, err := l.shouldProvisionLoadBalancer(service)
+	if err != nil {
+		return nil, false, fmt.Errorf("%s: %w", op, err)
+	}
+	if !enabled {
+		return nil, false, nil
+	}
 
 	lb, err := l.lbOps.GetByK8SServiceUID(ctx, service)
 	if err != nil {
@@ -109,6 +139,7 @@ func (l *loadBalancers) EnsureLoadBalancer(
 	metrics.OperationCalled.WithLabelValues(op).Inc()
 
 	var (
+		exists        bool
 		reload        bool
 		lb            *hcloud.LoadBalancer
 		err           error
@@ -147,8 +178,38 @@ func (l *loadBalancers) EnsureLoadBalancer(
 		}
 	}
 
-	// If we were still not able to find the load balancer we create it.
-	if errors.Is(err, hcops.ErrNotFound) {
+	// If we were still not able to find the load balancer we should create it.
+	exists = (lb != nil && !errors.Is(err, hcops.ErrNotFound))
+
+	// Skip provisioning when service annotation + default config indicate so.
+	enabled, err := l.shouldProvisionLoadBalancer(svc)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+	if !enabled {
+		// If provisioning is disabled for this Service, ensure we don't leave
+		// an orphaned Hetzner Load Balancer behind: try to look it up and
+		// delete it if present (mirrors EnsureLoadBalancerDeleted behavior).
+
+		if exists {
+			if lb.Protection.Delete {
+				klog.InfoS("ignored: load balancer (orphaned) deletion protected", "op", op, "loadBalancerID", lb.ID)
+				return &corev1.LoadBalancerStatus{}, nil
+			}
+
+			klog.InfoS("delete Load Balancer (orphaned)", "op", op, "loadBalancerID", lb.ID)
+			err = l.lbOps.Delete(ctx, lb)
+			if errors.Is(err, hcops.ErrNotFound) {
+				return &corev1.LoadBalancerStatus{}, nil
+			}
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", op, err)
+			}
+		}
+		return &corev1.LoadBalancerStatus{}, nil
+	}
+
+	if !exists {
 		lb, err = l.lbOps.Create(ctx, lbName, svc)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", op, err)
@@ -333,6 +394,30 @@ func (l *loadBalancers) UpdateLoadBalancer(
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
+	// Decide whether this Service should be provisioned based on annotation +
+	// global default. If provisioning is disabled we may need to delete an
+	// existing Hetzner Load Balancer.
+	enabled, err := l.shouldProvisionLoadBalancer(svc)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	if !enabled {
+		if lb.Protection.Delete {
+			klog.InfoS("ignored: load balancer deletion protected", "op", op, "loadBalancerID", lb.ID)
+			return nil
+		}
+
+		klog.InfoS("delete Load Balancer (disabled)", "op", op, "loadBalancerID", lb.ID)
+		err = l.lbOps.Delete(ctx, lb)
+		if errors.Is(err, hcops.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", op, err)
+		}
+		return nil
+	}
+
 	if _, err = l.lbOps.ReconcileHCLB(ctx, lb, svc); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -348,6 +433,16 @@ func (l *loadBalancers) UpdateLoadBalancer(
 func (l *loadBalancers) EnsureLoadBalancerDeleted(ctx context.Context, _ string, service *corev1.Service) error {
 	const op = "hcloud/loadBalancers.EnsureLoadBalancerDeleted"
 	metrics.OperationCalled.WithLabelValues(op).Inc()
+
+	// Skip processing when service annotation + default config indicate so.
+	enabled, err := l.shouldProvisionLoadBalancer(service)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	if !enabled {
+		// Nothing to delete for this service.
+		return nil
+	}
 
 	loadBalancer, err := l.lbOps.GetByK8SServiceUID(ctx, service)
 	if errors.Is(err, hcops.ErrNotFound) {

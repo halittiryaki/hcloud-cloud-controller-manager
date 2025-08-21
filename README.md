@@ -60,6 +60,12 @@ On code change, skaffold will rebuild the image, redeploy it and print all logs.
 make -C dev down
 ```
 
+#### manual build
+```
+docker run --rm -v /usr/src/opensource/hcloud-cloud-controller-manager:/src -w /src golang:1.24 sh -c 'CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags="-s -w" -o hcloud-cloud-controller-manager .'
+```
+
+
 ### Run the unit tests
 
 To run the unit tests, make sure you installed the following tools:
