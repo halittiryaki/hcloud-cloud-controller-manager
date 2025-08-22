@@ -52,6 +52,12 @@ env:
         name: hcloud
         key: token
 
+  # Optional: only lookup nodes matching this Kubernetes label selector against the Hetzner APIs.
+  # Example: "node.kubernetes.io/provider=hetzner"
+  # If unset, the controller will attempt to lookup every node (existing behavior).
+  HCLOUD_HETZNER_NODE_SELECTOR:
+    value: ""
+
   ROBOT_USER:
     valueFrom:
       secretKeyRef:

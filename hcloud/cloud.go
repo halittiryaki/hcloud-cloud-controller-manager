@@ -85,7 +85,11 @@ func NewCloud(cidr string) (cloudprovider.Interface, error) {
 		opts = append(opts, hcloud.WithEndpoint(cfg.HCloudClient.Endpoint))
 	}
 	client := hcloud.NewClient(opts...)
-	metadataClient := metadata.NewClient()
+	var metadataOpts []metadata.ClientOption
+	if cfg.HCloudClient.MetadataEndpoint != "" {
+		metadataOpts = append(metadataOpts, metadata.WithEndpoint(cfg.HCloudClient.MetadataEndpoint))
+	}
+	metadataClient := metadata.NewClient(metadataOpts...)
 
 	var robotClient robot.Client
 	if cfg.Robot.Enabled {
@@ -181,7 +185,7 @@ func (c *cloud) LoadBalancer() (cloudprovider.LoadBalancer, bool) {
 		Recorder:      c.recorder,
 	}
 
-	return newLoadBalancers(lbOps, c.cfg.LoadBalancer.PrivateIngressEnabled, c.cfg.LoadBalancer.IPv6Enabled, c.cfg.LoadBalancer.DefaultProvision), true
+	return newLoadBalancers(lbOps, c.cfg.LoadBalancer.PrivateIngressEnabled, c.cfg.LoadBalancer.IPv6Enabled, c.cfg.LoadBalancer.DefaultProvision, c.cfg), true
 }
 
 func (c *cloud) Clusters() (cloudprovider.Clusters, bool) {

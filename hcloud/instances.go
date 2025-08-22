@@ -24,6 +24,7 @@ import (
 
 	hrobotmodels "github.com/syself/hrobot-go/models"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/klog/v2"
@@ -76,6 +77,21 @@ func (i *instances) lookupServer(
 	ctx context.Context,
 	node *corev1.Node,
 ) (genericServer, error) {
+	// If a Hetzner-specific node selector is configured, only attempt a real
+	// API lookup for nodes that match the selector. Non-matching nodes will be
+	// handled by a mocked server implementation that derives metadata from
+	// the Node object itself.
+	if i.cfg.HetznerNodeSelector != "" {
+		sel, err := labels.Parse(i.cfg.HetznerNodeSelector)
+		if err != nil {
+			return nil, fmt.Errorf("invalid hetzner node selector: %w", err)
+		}
+		if !sel.Matches(labels.Set(node.Labels)) {
+			klog.Infof("Node %s does not match HetznerNodeSelector %q, treating as unmanaged", node.Name, i.cfg.HetznerNodeSelector)
+			return unmanagedServer{node: node}, nil
+		}
+	}
+
 	if node.Spec.ProviderID != "" {
 		var serverID int64
 		serverID, isCloudServer, err := providerid.ToServerID(node.Spec.ProviderID)
@@ -204,6 +220,10 @@ func (i *instances) InstanceMetadata(ctx context.Context, node *corev1.Node) (*c
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
+	if metadata != nil {
+		klog.Infof("InstanceMetadata for node %s returned providerID=%s", node.Name, metadata.ProviderID)
+	}
+
 	return metadata, nil
 }
 
@@ -324,6 +344,66 @@ func robotNodeAddresses(
 	}
 
 	return addresses
+}
+
+type unmanagedServer struct {
+	node *corev1.Node
+}
+
+func (s unmanagedServer) IsShutdown() (bool, error) {
+	// We cannot determine the real shutdown state for non-Hetzner nodes;
+	// assume the instance is running.
+	return false, nil
+}
+
+func (s unmanagedServer) Metadata(_ int64, node *corev1.Node, _ config.HCCMConfiguration) (*cloudprovider.InstanceMetadata, error) {
+	n := s.node
+	// ProviderID: prefer Spec.ProviderID, otherwise derive from labels/name:
+	// provider://hostname
+	providerID := n.Spec.ProviderID
+	if providerID == "" {
+		provider := n.Labels["node.kubernetes.io/provider"]
+		if provider == "" {
+			provider = "unknown"
+		}
+
+		hostname := n.Labels["kubernetes.io/hostname"]
+		if hostname == "" {
+			hostname = n.Name
+		}
+
+		providerID = fmt.Sprintf("%s://%s", provider, hostname)
+	}
+
+	instanceType := n.Labels["node.kubernetes.io/instance-type"]
+	if instanceType == "" {
+		instanceType = "generic"
+	}
+
+	zone := n.Labels["topology.kubernetes.io/zone"]
+	if zone == "" {
+		zone = "n/a"
+	}
+
+	region := n.Labels["topology.kubernetes.io/region"]
+	if region == "" {
+		region = "n/a"
+	}
+
+	addresses := n.Status.Addresses
+	// Ensure we return a non-nil slice
+	if addresses == nil {
+		addresses = []corev1.NodeAddress{}
+	}
+
+	return &cloudprovider.InstanceMetadata{
+		ProviderID:       providerID,
+		InstanceType:     instanceType,
+		NodeAddresses:    addresses,
+		Zone:             zone,
+		Region:           region,
+		AdditionalLabels: map[string]string{},
+	}, nil
 }
 
 type genericServer interface {

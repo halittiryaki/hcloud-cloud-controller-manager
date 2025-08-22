@@ -7,16 +7,18 @@ import (
 	"strconv"
 	"time"
 
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 
 	"github.com/hetznercloud/hcloud-go/v2/hcloud/exp/kit/envutil"
 )
 
 const (
-	hcloudToken    = "HCLOUD_TOKEN"
-	hcloudEndpoint = "HCLOUD_ENDPOINT"
-	hcloudNetwork  = "HCLOUD_NETWORK"
-	hcloudDebug    = "HCLOUD_DEBUG"
+	hcloudToken            = "HCLOUD_TOKEN"
+	hcloudEndpoint         = "HCLOUD_ENDPOINT"
+	hcloudMetadataEndpoint = "HCLOUD_METADATAENDPOINT"
+	hcloudNetwork          = "HCLOUD_NETWORK"
+	hcloudDebug            = "HCLOUD_DEBUG"
 
 	robotEnabled            = "ROBOT_ENABLED"
 	robotUser               = "ROBOT_USER"
@@ -41,12 +43,18 @@ const (
 
 	hcloudMetricsEnabled = "HCLOUD_METRICS_ENABLED"
 	hcloudMetricsAddress = ":8233"
+
+	// Hetzner node selector (Kubernetes label selector syntax). When set, only nodes
+	// matching this selector will be looked up against the Hetzner APIs. Non-matching
+	// nodes will receive mocked instance metadata derived from the Node object.
+	hcloudHetznerNodeSelector = "HCLOUD_HETZNER_NODE_SELECTOR"
 )
 
 type HCloudClientConfiguration struct {
-	Token    string
-	Endpoint string
-	Debug    bool
+	Token            string
+	Endpoint         string
+	MetadataEndpoint string
+	Debug            bool
 }
 
 type RobotConfiguration struct {
@@ -109,6 +117,10 @@ type HCCMConfiguration struct {
 	LoadBalancer LoadBalancerConfiguration
 	Network      NetworkConfiguration
 	Route        RouteConfiguration
+	// HetznerNodeSelector stores an optional Kubernetes label selector (string).
+	// When set, only nodes matching this selector will be processed against
+	// the Hetzner APIs; non-matching nodes will receive mocked metadata.
+	HetznerNodeSelector string
 }
 
 // Read evaluates all environment variables and returns a [HCCMConfiguration]. It only validates as far as
@@ -126,6 +138,7 @@ func Read() (HCCMConfiguration, error) {
 		errs = append(errs, err)
 	}
 	cfg.HCloudClient.Endpoint = os.Getenv(hcloudEndpoint)
+	cfg.HCloudClient.MetadataEndpoint = os.Getenv(hcloudMetadataEndpoint)
 	cfg.HCloudClient.Debug, err = getEnvBool(hcloudDebug, false)
 	if err != nil {
 		errs = append(errs, err)
@@ -203,6 +216,8 @@ func Read() (HCCMConfiguration, error) {
 	}
 
 	cfg.Network.NameOrID = os.Getenv(hcloudNetwork)
+	// Read optional hetzner node selector from env
+	cfg.HetznerNodeSelector = os.Getenv(hcloudHetznerNodeSelector)
 	disableAttachedCheck, err := getEnvBool(hcloudNetworkDisableAttachedCheck, false)
 	if err != nil {
 		errs = append(errs, err)
@@ -253,6 +268,12 @@ func (c HCCMConfiguration) Validate() (err error) {
 
 		if c.Route.Enabled {
 			errs = append(errs, fmt.Errorf("using Routes with Robot is not supported"))
+		}
+	}
+
+	if c.HetznerNodeSelector != "" {
+		if _, err := labels.Parse(c.HetznerNodeSelector); err != nil {
+			errs = append(errs, fmt.Errorf("invalid value for %q: %w", hcloudHetznerNodeSelector, err))
 		}
 	}
 

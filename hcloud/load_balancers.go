@@ -11,6 +11,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/annotation"
+	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/config"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/hcops"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/metrics"
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
@@ -40,14 +41,20 @@ type loadBalancers struct {
 	// is not present. This mirrors the configuration option exposed by the
 	// HCCM configuration.
 	svcProcessingDefault bool
+
+	// cfg stores the controller configuration so that features like the
+	// Hetzner node selector can be applied when deciding which nodes to
+	// process against the Hetzner APIs.
+	cfg config.HCCMConfiguration
 }
 
-func newLoadBalancers(lbOps LoadBalancerOps, privateIngressEnabledDefault bool, ipv6EnabledDefault bool, svcProcessingDefault bool) *loadBalancers {
+func newLoadBalancers(lbOps LoadBalancerOps, privateIngressEnabledDefault bool, ipv6EnabledDefault bool, svcProcessingDefault bool, cfg config.HCCMConfiguration) *loadBalancers {
 	return &loadBalancers{
 		lbOps:                        lbOps,
 		ipv6EnabledDefault:           ipv6EnabledDefault,
 		privateIngressEnabledDefault: privateIngressEnabledDefault,
 		svcProcessingDefault:         svcProcessingDefault,
+		cfg:                          cfg,
 	}
 }
 
@@ -65,26 +72,61 @@ func (l *loadBalancers) shouldProvisionLoadBalancer(svc *corev1.Service) (bool, 
 	return false, err
 }
 
-func matchNodeSelector(svc *corev1.Service, nodes []*corev1.Node) ([]*corev1.Node, error) {
-	var (
-		err           error
-		selectedNodes []*corev1.Node
-	)
+func (l *loadBalancers) matchNodeSelector(svc *corev1.Service, nodes []*corev1.Node) ([]*corev1.Node, error) {
+	var selectedNodes []*corev1.Node
 
+	// Prepare selectors; default to Everything()
+	confSel := labels.Everything()
+	annSel := labels.Everything()
+
+	// Apply Hetzner-wide node selector from controller configuration if set.
+	if l.cfg.HetznerNodeSelector != "" {
+		tmpSel, err := labels.Parse(l.cfg.HetznerNodeSelector)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse hetzner node selector from config: %w", err)
+		}
+		confSel = tmpSel
+	}
+
+	// Apply per-service node selector annotation if present.
+	if v, ok := annotation.LBNodeSelector.StringFromService(svc); ok {
+		tmpSel, err := labels.Parse(v)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse the node-selector annotation: %w", err)
+		}
+		annSel = tmpSel
+	}
+
+	for _, n := range nodes {
+		ls := labels.Set(n.GetLabels())
+		if confSel.Matches(ls) && annSel.Matches(ls) {
+			selectedNodes = append(selectedNodes, n)
+		}
+	}
+
+	return selectedNodes, nil
+}
+
+// matchNodeSelector is kept as a package-level helper for existing unit tests and
+// for callers that expect the legacy behaviour: only the per-Service annotation is
+// considered. Production code should call the method receiver l.matchNodeSelector to
+// take the controller-level HetznerNodeSelector config into account.
+func matchNodeSelector(svc *corev1.Service, nodes []*corev1.Node) ([]*corev1.Node, error) {
 	selector := labels.Everything()
 	if v, ok := annotation.LBNodeSelector.StringFromService(svc); ok {
+		var err error
 		selector, err = labels.Parse(v)
 		if err != nil {
 			return nil, fmt.Errorf("unable to parse the node-selector annotation: %w", err)
 		}
 	}
 
+	var selectedNodes []*corev1.Node
 	for _, n := range nodes {
 		if selector.Matches(labels.Set(n.GetLabels())) {
 			selectedNodes = append(selectedNodes, n)
 		}
 	}
-
 	return selectedNodes, nil
 }
 
@@ -146,7 +188,7 @@ func (l *loadBalancers) EnsureLoadBalancer(
 		selectedNodes []*corev1.Node
 	)
 
-	selectedNodes, err = matchNodeSelector(svc, nodes)
+	selectedNodes, err = l.matchNodeSelector(svc, nodes)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
@@ -369,7 +411,7 @@ func (l *loadBalancers) UpdateLoadBalancer(
 		selectedNodes []*corev1.Node
 	)
 
-	selectedNodes, err = matchNodeSelector(svc, nodes)
+	selectedNodes, err = l.matchNodeSelector(svc, nodes)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}

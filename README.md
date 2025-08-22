@@ -112,6 +112,12 @@ export ROBOT_PASSWORD=<Your Robot Password>
 go test ./tests/e2e -tags e2e,robot -v
 ```
 
+# taint needed for cluster init (node init , set providerid)
+- node.cloudprovider.kubernetes.io/uninitialized
+
+
 ## License
 
 Apache License, Version 2.0
+
+

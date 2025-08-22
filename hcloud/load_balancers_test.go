@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/annotation"
+	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/config"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/hcops"
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 )
@@ -987,7 +988,7 @@ func TestShouldProcessService_Combinations(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// create controller with given default
 			lbOps := &hcops.MockLoadBalancerOps{}
-			lb := newLoadBalancers(lbOps, true, true, tc.defaultProvision)
+			lb := newLoadBalancers(lbOps, true, true, tc.defaultProvision, config.HCCMConfiguration{})
 
 			// create service and set annotation if needed
 			svc := &corev1.Service{

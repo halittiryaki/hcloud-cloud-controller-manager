@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/annotation"
+	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/config"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/hcops"
 	"github.com/hetznercloud/hcloud-cloud-controller-manager/internal/mocks"
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
@@ -86,7 +87,7 @@ func (tt *LoadBalancerTestCase) run(t *testing.T) {
 		tt.UseSvcProcessingDefault = hcloud.Ptr(true)
 	}
 
-	tt.LoadBalancers = newLoadBalancers(tt.LBOps, *tt.UsePrivateIngressDefault, *tt.UseIPv6Default, *tt.UseSvcProcessingDefault)
+	tt.LoadBalancers = newLoadBalancers(tt.LBOps, *tt.UsePrivateIngressDefault, *tt.UseIPv6Default, *tt.UseSvcProcessingDefault, config.HCCMConfiguration{})
 	tt.Perform(t, tt)
 
 	tt.LBOps.AssertExpectations(t)
